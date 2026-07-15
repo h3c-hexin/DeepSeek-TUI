@@ -675,8 +675,7 @@ fn test_parse_spawn_request_rejects_out_of_range_max_depth() {
         "prompt": "inspect parser",
         "max_depth": ceiling + 1
     });
-    let err =
-        parse_spawn_request(&input).expect_err("max_depth above ceiling should be rejected");
+    let err = parse_spawn_request(&input).expect_err("max_depth above ceiling should be rejected");
     assert!(
         err.to_string()
             .contains(&format!("max_depth must be between 0 and {ceiling}"))

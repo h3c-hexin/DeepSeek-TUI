@@ -246,7 +246,9 @@ pub struct ExtraTools(pub Vec<std::sync::Arc<dyn crate::tools::spec::ToolSpec>>)
 
 impl std::fmt::Debug for ExtraTools {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.0.iter().map(|t| t.name())).finish()
+        f.debug_list()
+            .entries(self.0.iter().map(|t| t.name()))
+            .finish()
     }
 }
 
@@ -1485,7 +1487,8 @@ impl Engine {
                                 .as_deref()
                                 .map(|err| format!("Failed to spawn sub-agent: {err}"))
                                 .unwrap_or_else(|| {
-                                    "Failed to spawn sub-agent: API client not configured".to_string()
+                                    "Failed to spawn sub-agent: API client not configured"
+                                        .to_string()
                                 });
                             let _ = self
                                 .tx_event
@@ -1641,7 +1644,8 @@ impl Engine {
                     Op::SetDisallowedTools { tools } => {
                         // pinvou3 会话级工具开关:写入 config.disallowed_tools,下一轮
                         // filter_tool_catalog_for_gates 即把这些工具对模型隐藏。空 = 不禁用。
-                        self.config.disallowed_tools = if tools.is_empty() { None } else { Some(tools) };
+                        self.config.disallowed_tools =
+                            if tools.is_empty() { None } else { Some(tools) };
                     }
                     Op::ChangeMode { mode } => {
                         self.current_mode = mode;

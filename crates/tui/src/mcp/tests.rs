@@ -273,6 +273,46 @@ fn expand_env_placeholders_expands_stdio_env_value() {
 }
 
 #[test]
+fn expand_env_placeholders_expands_http_url_value() {
+    let _lock = crate::test_support::lock_test_env();
+    let _secret = crate::test_support::EnvVarGuard::set(
+        "PINVOU3_MCP_SECRET_PATSNAP_API_KEY",
+        "test-patsnap-secret-123456",
+    );
+
+    let expanded = expand_env_placeholders(
+        "https://connect.zhihuiya.com/2b0355/logic-mcp?apikey=${PINVOU3_MCP_SECRET_PATSNAP_API_KEY}",
+    )
+    .unwrap();
+
+    assert_eq!(
+        expanded,
+        "https://connect.zhihuiya.com/2b0355/logic-mcp?apikey=test-patsnap-secret-123456"
+    );
+}
+
+#[test]
+fn forkguard_mcp_url_secret_placeholders_expand_and_redact() {
+    let _lock = crate::test_support::lock_test_env();
+    let _secret = crate::test_support::EnvVarGuard::set(
+        "PINVOU3_MCP_SECRET_PATSNAP_FORKGUARD_API_KEY",
+        "forkguard-patsnap-secret-123456",
+    );
+
+    let expanded = expand_env_placeholders(
+        "https://connect.zhihuiya.com/2b0355/logic-mcp?apikey=${PINVOU3_MCP_SECRET_PATSNAP_FORKGUARD_API_KEY}&topic=ai",
+    )
+    .unwrap();
+    assert!(expanded.contains("apikey=forkguard-patsnap-secret-123456"));
+
+    let masked = mask_url_secrets(&expanded);
+    assert!(masked.contains("connect.zhihuiya.com"));
+    assert!(masked.contains("apikey="));
+    assert!(masked.contains("topic=ai"));
+    assert!(!masked.contains("forkguard-patsnap-secret-123456"));
+}
+
+#[test]
 fn expand_env_placeholders_reports_missing_variable_without_secret_value() {
     let _lock = crate::test_support::lock_test_env();
     let _missing = crate::test_support::EnvVarGuard::remove("PINVOU3_MCP_SECRET_MISSING");
@@ -283,6 +323,22 @@ fn expand_env_placeholders_reports_missing_variable_without_secret_value() {
 
     assert!(err.contains("PINVOU3_MCP_SECRET_MISSING"));
     assert!(!err.contains("Bearer "));
+}
+
+#[test]
+fn expand_env_placeholders_reports_missing_url_variable_without_secret_value() {
+    let _lock = crate::test_support::lock_test_env();
+    let _missing = crate::test_support::EnvVarGuard::remove("PINVOU3_MCP_SECRET_PATSNAP_MISSING");
+
+    let err = expand_env_placeholders(
+        "https://connect.zhihuiya.com/2b0355/logic-mcp?apikey=${PINVOU3_MCP_SECRET_PATSNAP_MISSING}",
+    )
+    .expect_err("missing url env should fail")
+    .to_string();
+
+    assert!(err.contains("PINVOU3_MCP_SECRET_PATSNAP_MISSING"));
+    assert!(!err.contains("connect.zhihuiya.com"));
+    assert!(!err.contains("apikey="));
 }
 
 #[tokio::test]
@@ -1944,6 +2000,29 @@ fn mask_url_secrets_strips_userinfo() {
 }
 
 #[test]
+fn mask_url_secrets_redacts_query_credentials() {
+    let masked = mask_url_secrets(
+        "https://connect.zhihuiya.com/2b0355/logic-mcp?apikey=test-secret&topic=ai&token=abc",
+    );
+
+    assert!(masked.contains("connect.zhihuiya.com"));
+    assert!(
+        masked.contains("apikey="),
+        "apikey key should be preserved: {masked}"
+    );
+    assert!(
+        masked.contains("token="),
+        "token key should be preserved: {masked}"
+    );
+    assert!(
+        masked.contains("topic=ai"),
+        "non-secret query should remain: {masked}"
+    );
+    assert!(!masked.contains("test-secret"), "apikey leaked: {masked}");
+    assert!(!masked.contains("token=abc"), "token leaked: {masked}");
+}
+
+#[test]
 fn mask_url_secrets_passes_through_clean_url() {
     assert_eq!(
         mask_url_secrets("https://api.example.com/mcp"),
@@ -2688,6 +2767,197 @@ async fn streamable_http_stale_session_reconnects_and_retries_tool_call() {
     assert!(stale_seen.load(AtomicOrdering::SeqCst));
     assert!(success_seen.load(AtomicOrdering::SeqCst));
     assert_eq!(get_count.load(AtomicOrdering::SeqCst), 2);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn streamable_http_url_placeholder_expands_before_connecting() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn write_response(socket: &mut tokio::net::TcpStream, response: &[u8]) {
+        socket.write_all(response).await.unwrap();
+        socket.flush().await.unwrap();
+        socket.shutdown().await.unwrap();
+    }
+
+    let _lock = lock_mcp_loopback_tests().await;
+    let _secret = crate::test_support::EnvVarGuard::set(
+        "PINVOU3_MCP_SECRET_PATSNAP_RUNTIME_API_KEY",
+        "test-patsnap-secret-123456",
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let expanded_key_seen = Arc::new(AtomicBool::new(false));
+    let literal_placeholder_seen = Arc::new(AtomicBool::new(false));
+    let server_expanded_key_seen = Arc::clone(&expanded_key_seen);
+    let server_literal_placeholder_seen = Arc::clone(&literal_placeholder_seen);
+
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let expanded_key_seen = Arc::clone(&server_expanded_key_seen);
+            let literal_placeholder_seen = Arc::clone(&server_literal_placeholder_seen);
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0; 4096];
+                let header_end = loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+                let request_line = headers.lines().next().unwrap_or_default().to_string();
+                if request_line.contains("${PINVOU3_MCP_SECRET_PATSNAP_RUNTIME_API_KEY}") {
+                    literal_placeholder_seen.store(true, AtomicOrdering::SeqCst);
+                }
+                if request_line.contains("apikey=test-patsnap-secret-123456") {
+                    expanded_key_seen.store(true, AtomicOrdering::SeqCst);
+                } else {
+                    write_response(
+                        &mut socket,
+                        b"HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: 18\r\n\r\nmissing api key",
+                    )
+                    .await;
+                    return;
+                }
+
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                }
+
+                if request_line.starts_with("GET /mcp?") {
+                    write_response(
+                        &mut socket,
+                        b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await;
+                    return;
+                }
+
+                let body = &request[header_end..header_end + content_length];
+                let request_json: serde_json::Value = serde_json::from_slice(body).unwrap();
+                let method = request_json
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let id = request_json
+                    .get("id")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!("0"));
+
+                let result = match method {
+                    "initialize" => serde_json::json!({
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {}
+                    }),
+                    "tools/list" => serde_json::json!({
+                        "tools": [
+                            { "name": "patsnap_search", "inputSchema": {} }
+                        ]
+                    }),
+                    "resources/list" => serde_json::json!({ "resources": [] }),
+                    "resources/templates/list" => {
+                        serde_json::json!({ "resourceTemplates": [] })
+                    }
+                    "prompts/list" => serde_json::json!({ "prompts": [] }),
+                    _ => {
+                        write_response(
+                            &mut socket,
+                            b"HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                let response_body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                write_response(&mut socket, response.as_bytes()).await;
+            });
+        }
+    });
+
+    let mut cfg = McpConfig::default();
+    cfg.servers.insert(
+        "patsnap-search".to_string(),
+        McpServerConfig {
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            url: Some(format!(
+                "http://{addr}/mcp?apikey=${{PINVOU3_MCP_SECRET_PATSNAP_RUNTIME_API_KEY}}"
+            )),
+            transport: None,
+            connect_timeout: Some(10),
+            execute_timeout: Some(10),
+            read_timeout: None,
+            disabled: false,
+            enabled: true,
+            required: false,
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            headers: HashMap::new(),
+            env_headers: HashMap::new(),
+            bearer_token_env_var: None,
+            scopes: Vec::new(),
+            oauth: None,
+            oauth_resource: None,
+        },
+    );
+    let mut pool = McpPool::new(cfg);
+
+    let errors = pool.connect_all().await;
+
+    assert!(
+        errors.is_empty(),
+        "MCP should connect with expanded apikey, got: {errors:?}"
+    );
+    assert!(
+        expanded_key_seen.load(AtomicOrdering::SeqCst),
+        "server never observed expanded apikey"
+    );
+    assert!(
+        !literal_placeholder_seen.load(AtomicOrdering::SeqCst),
+        "server observed raw env placeholder"
+    );
+    assert_eq!(
+        pool.all_tools()
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["mcp_patsnap-search_patsnap_search"]
+    );
 
     server.abort();
 }
