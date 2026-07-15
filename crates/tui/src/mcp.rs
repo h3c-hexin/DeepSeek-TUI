@@ -96,9 +96,36 @@ fn mask_url_secrets(url: &str) -> String {
             let _ = clone.set_username("***");
             let _ = clone.set_password(Some("***"));
         }
+        if parsed.query().is_some() {
+            let query_pairs = parsed
+                .query_pairs()
+                .map(|(key, value)| {
+                    let lower = key.to_ascii_lowercase();
+                    let redacted = matches!(
+                        lower.as_str(),
+                        "apikey" | "api_key" | "api-key" | "token" | "access_token" | "key"
+                    );
+                    (
+                        key.into_owned(),
+                        if redacted {
+                            "***".to_string()
+                        } else {
+                            value.into_owned()
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            clone.set_query(None);
+            {
+                let mut pairs = clone.query_pairs_mut();
+                for (key, value) in query_pairs {
+                    pairs.append_pair(&key, &value);
+                }
+            }
+        }
         return clone.to_string();
     }
-    url.to_string()
+    redact_body_preview(url)
 }
 
 /// Redact the userinfo segment (`username[:password]@…` portion) from
@@ -1371,11 +1398,13 @@ impl McpConnection {
         let cancel_token = tokio_util::sync::CancellationToken::new();
 
         let transport: Box<dyn McpTransport> = if let Some(url) = &config.url {
+            let expanded_url = expand_env_placeholders(url)
+                .with_context(|| format!("MCP server '{name}' URL expansion failed"))?;
             // Per-domain network policy gate (#135). Only the HTTP/SSE transport
             // is gated; STDIO MCP servers run as local subprocesses and never
             // touch the network from this code path.
             if let Some(decider) = network_policy
-                && let Some(host) = host_from_url(url)
+                && let Some(host) = host_from_url(&expanded_url)
             {
                 match decider.evaluate(&host, "mcp") {
                     Decision::Allow => {}
@@ -1471,7 +1500,7 @@ impl McpConnection {
                 Box::new(
                     SseTransport::connect(
                         client,
-                        url.clone(),
+                        expanded_url.clone(),
                         http_auth,
                         cancel_token.clone(),
                         Duration::from_secs(connect_timeout_secs),
@@ -1481,7 +1510,7 @@ impl McpConnection {
             } else {
                 let mut http = HttpTransport::new(
                     client,
-                    url.clone(),
+                    expanded_url,
                     http_auth,
                     cancel_token.clone(),
                     Duration::from_secs(connect_timeout_secs),

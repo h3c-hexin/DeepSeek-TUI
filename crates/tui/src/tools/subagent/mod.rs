@@ -39,8 +39,8 @@ use crate::tools::spec::{
 };
 use crate::tools::todo::{SharedTodoList, TodoList};
 use crate::tools::user_input::{UserInputDecision, UserInputRequest};
-use crate::worker_profile::WorkerRuntimeProfile;
 use crate::utils::spawn_supervised;
+use crate::worker_profile::WorkerRuntimeProfile;
 
 pub mod mailbox;
 #[allow(unused_imports)]
@@ -4853,9 +4853,9 @@ async fn run_subagent_task(task: SubAgentTask) {
     // [pinvou3-fork] Interrupted(SSE 超时/放弃)/Cancelled 也算 failed——半成品不应
     // 被宿主当成功接收。当前宿主推进靠产物硬闸(page_output_is_real/validate_deliverable)
     // 而非此布尔，故主要影响日志/语义准确性 + 防未来有消费方误判。
-    let failed = result.as_ref().map_or(true, |res| {
-        !matches!(res.status, SubAgentStatus::Completed)
-    });
+    let failed = result
+        .as_ref()
+        .map_or(true, |res| !matches!(res.status, SubAgentStatus::Completed));
 
     if let Some(mb) = task.runtime.mailbox.as_ref() {
         let envelope = match &result {
@@ -5780,7 +5780,9 @@ async fn run_subagent(
                         record_agent_progress(
                             runtime,
                             &agent_id,
-                            format!("step {steps}/{max_steps}: 催促 submit_output({structured_retries}/{MAX_STRUCTURED_OUTPUT_RETRIES})"),
+                            format!(
+                                "step {steps}/{max_steps}: 催促 submit_output({structured_retries}/{MAX_STRUCTURED_OUTPUT_RETRIES})"
+                            ),
                         );
                         continue;
                     }
@@ -5806,7 +5808,9 @@ async fn run_subagent(
                     record_agent_progress(
                         runtime,
                         &agent_id,
-                        format!("step {steps}/{max_steps}: 催促 write_file({file_output_retries}/{MAX_STRUCTURED_OUTPUT_RETRIES})"),
+                        format!(
+                            "step {steps}/{max_steps}: 催促 write_file({file_output_retries}/{MAX_STRUCTURED_OUTPUT_RETRIES})"
+                        ),
                     );
                     continue;
                 }
@@ -5851,7 +5855,8 @@ async fn run_subagent(
                 });
             }
             let result = if round_has_submit && tool_name != SUBMIT_OUTPUT_TOOL {
-                "本轮已调用 submit_output，其他工具调用已跳过；请等待 submit_output 的校验结果。".to_string()
+                "本轮已调用 submit_output，其他工具调用已跳过；请等待 submit_output 的校验结果。"
+                    .to_string()
             } else if tool_name == SUBMIT_OUTPUT_TOOL && output_schema.is_some() {
                 let schema = output_schema.as_ref().expect("checked above");
                 match validate_against_schema(&tool_input, schema) {
@@ -5865,18 +5870,24 @@ async fn run_subagent(
                             structured_retries += 1;
                             let err = "产出未落盘任何文件".to_string();
                             last_structured_error = Some(err.clone());
-                            format!("Error: {err}(第 {structured_retries}/{MAX_STRUCTURED_OUTPUT_RETRIES} 次)")
+                            format!(
+                                "Error: {err}(第 {structured_retries}/{MAX_STRUCTURED_OUTPUT_RETRIES} 次)"
+                            )
                         }
                         Err(write_err) => {
                             structured_retries += 1;
                             last_structured_error = Some(write_err.clone());
-                            format!("Error: 产出校验通过但落盘失败(第 {structured_retries}/{MAX_STRUCTURED_OUTPUT_RETRIES} 次): {write_err}")
+                            format!(
+                                "Error: 产出校验通过但落盘失败(第 {structured_retries}/{MAX_STRUCTURED_OUTPUT_RETRIES} 次): {write_err}"
+                            )
                         }
                     },
                     Err(field_errors) => {
                         structured_retries += 1;
                         last_structured_error = Some(field_errors.clone());
-                        format!("提交未通过校验(第 {structured_retries}/{MAX_STRUCTURED_OUTPUT_RETRIES} 次),请修正后重新调用 submit_output:\n{field_errors}")
+                        format!(
+                            "提交未通过校验(第 {structured_retries}/{MAX_STRUCTURED_OUTPUT_RETRIES} 次),请修正后重新调用 submit_output:\n{field_errors}"
+                        )
                     }
                 }
             } else if tool_name == "request_user_input" && runtime.user_input_tx.is_some() {
@@ -7409,13 +7420,19 @@ fn value_cn(v: &Value) -> &'static str {
 /// 递归校验单个节点。`path` 是给弱模型看的字段路径(如 `inventory[].type`)。
 /// [codex Q3 复审修] `depth` 防超深 schema 栈溢出;`$ref` 暂不支持,显式报错而非静默跳过。
 fn validate_node(value: &Value, schema: &Value, path: &str, depth: usize, errs: &mut Vec<String>) {
-    let label = if path.is_empty() { "(根)".to_string() } else { format!("「{path}」") };
+    let label = if path.is_empty() {
+        "(根)".to_string()
+    } else {
+        format!("「{path}」")
+    };
     if depth > 32 {
         errs.push(format!("❌ 字段{label}:schema 嵌套过深(>32 层),拒绝校验。"));
         return;
     }
     if schema.get("$ref").is_some() {
-        errs.push(format!("❌ 字段{label}:schema 用了 $ref,当前轻量校验器不支持,请改用内联 schema。"));
+        errs.push(format!(
+            "❌ 字段{label}:schema 用了 $ref,当前轻量校验器不支持,请改用内联 schema。"
+        ));
         return;
     }
 
@@ -7468,10 +7485,16 @@ fn validate_node(value: &Value, schema: &Value, path: &str, depth: usize, errs: 
         if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
             for rf in required {
                 if let Some(field) = rf.as_str() {
-                    let fpath = if path.is_empty() { field.to_string() } else { format!("{path}.{field}") };
+                    let fpath = if path.is_empty() {
+                        field.to_string()
+                    } else {
+                        format!("{path}.{field}")
+                    };
                     match obj.get(field) {
                         None => errs.push(format!("❌ 缺必填字段「{fpath}」,请补上。")),
-                        Some(Value::Null) => errs.push(format!("❌ 必填字段「{fpath}」是 null,请填真实内容。")),
+                        Some(Value::Null) => {
+                            errs.push(format!("❌ 必填字段「{fpath}」是 null,请填真实内容。"))
+                        }
                         Some(Value::String(s)) if s.trim().is_empty() => {
                             errs.push(format!("❌ 必填字段「{fpath}」是空字符串,请填真实内容。"))
                         }
@@ -7482,11 +7505,17 @@ fn validate_node(value: &Value, schema: &Value, path: &str, depth: usize, errs: 
         }
         if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
             for (field, fschema) in props {
-                let Some(actual) = obj.get(field) else { continue };
+                let Some(actual) = obj.get(field) else {
+                    continue;
+                };
                 if actual.is_null() {
                     continue;
                 }
-                let fpath = if path.is_empty() { field.clone() } else { format!("{path}.{field}") };
+                let fpath = if path.is_empty() {
+                    field.clone()
+                } else {
+                    format!("{path}.{field}")
+                };
                 validate_node(actual, fschema, &fpath, depth + 1, errs);
             }
         }
@@ -7565,8 +7594,8 @@ fn persist_structured_output(
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("建目录失败 {rel}: {e}"))?;
         }
-        let s = serde_json::to_string_pretty(content)
-            .map_err(|e| format!("序列化失败 {rel}: {e}"))?;
+        let s =
+            serde_json::to_string_pretty(content).map_err(|e| format!("序列化失败 {rel}: {e}"))?;
         fs::write(&path, s).map_err(|e| format!("写文件失败 {rel}: {e}"))?;
         written.push(rel.to_string());
         Ok(())
@@ -7592,8 +7621,6 @@ fn persist_structured_output(
     }
     Ok(written)
 }
-
-
 
 /// Max length of the human-friendly one-line summary emitted alongside the
 /// completion sentinel. Longer results are clipped and the full transcript is
