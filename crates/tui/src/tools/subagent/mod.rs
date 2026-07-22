@@ -7722,14 +7722,18 @@ const MAX_STRUCTURED_OUTPUT_RETRIES: u32 = 3;
 const FILE_OUTPUT_FAILURE_DETAIL_CHARS: usize = 2_000;
 
 fn file_output_failure_reason(last_tool_error: Option<&str>) -> String {
-    let Some(error) = last_tool_error.map(str::trim).filter(|error| !error.is_empty()) else {
+    let Some(error) = last_tool_error
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+    else {
         return "未产出任何文件".to_string();
     };
-    let clipped = error
+    let sanitized = codewhale_config::persistence::redact_secrets(error);
+    let clipped = sanitized
         .chars()
         .take(FILE_OUTPUT_FAILURE_DETAIL_CHARS)
         .collect::<String>();
-    let suffix = if error.chars().count() > FILE_OUTPUT_FAILURE_DETAIL_CHARS {
+    let suffix = if sanitized.chars().count() > FILE_OUTPUT_FAILURE_DETAIL_CHARS {
         "…"
     } else {
         ""
@@ -9648,9 +9652,24 @@ impl SubAgentToolRegistry {
         }
 
         let registry = registry.build(context);
+        // The spawn-time profile already intersects the child's requested tool
+        // list with every ancestor's explicit scope. Enforce that derived scope
+        // again at the registry boundary so a nested Custom worker cannot
+        // reintroduce a tool that its parent was not allowed to call.
+        let effective_allowed_tools = match (&runtime.worker_profile.tools, explicit_allowed_tools)
+        {
+            (ToolScope::Explicit(parent), Some(child)) => Some(
+                child
+                    .into_iter()
+                    .filter(|name| parent.contains(name))
+                    .collect(),
+            ),
+            (ToolScope::Explicit(parent), None) => Some(parent.clone()),
+            (ToolScope::Inherit, child) => child,
+        };
 
         Self {
-            allowed_tools: explicit_allowed_tools,
+            allowed_tools: effective_allowed_tools,
             disallowed_tools: runtime.worker_profile.denied_tools.clone(),
             auto_approve: runtime.context.auto_approve,
             accept_edits: runtime.accept_edits,
