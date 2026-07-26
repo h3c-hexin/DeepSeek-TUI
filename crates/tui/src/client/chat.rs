@@ -188,13 +188,36 @@ fn mirror_minimax_reasoning_details_for_body(body: &mut Value, provider: ApiProv
     mirror_minimax_reasoning_details_for_messages(messages);
 }
 
+/// [pinvou3-fork] Send an explicit `parallel_tool_calls` flag when the
+/// provider opts in via `[providers.<name>] parallel_tool_calls`. The engine
+/// never sends the field on its own, so endpoints whose server-side default
+/// is `false` (e.g. DashScope compatible mode) stay serial unless configured.
+/// Only emitted when the request actually carries at least one tool; an
+/// empty `tools: []` array is treated like a tool-less request, matching the
+/// anthropic path's non-empty guard.
+fn apply_parallel_tool_calls(body: &mut Value, configured: Option<bool>) {
+    let has_tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    if let Some(enabled) = configured
+        && has_tools
+    {
+        body["parallel_tool_calls"] = json!(enabled);
+    }
+}
+
 impl DeepSeekClient {
     pub(super) async fn create_message_chat(
         &self,
         request: &MessageRequest,
     ) -> Result<MessageResponse> {
         let cacheable = crate::llm_response_cache::request_is_cacheable(request);
-        let messages = build_chat_messages_for_request_and_provider(request, self.api_provider);
+        let messages = build_chat_messages_for_request_and_provider(
+            request,
+            self.api_provider,
+            self.replay_reasoning_content,
+        );
         let model =
             wire_model_for_provider_route(self.api_provider, &self.base_url, &request.model);
         let mut body = json!({
@@ -230,6 +253,7 @@ impl DeepSeekClient {
             }
             body["tools"] = json!(chat_tools);
         }
+        apply_parallel_tool_calls(&mut body, self.parallel_tool_calls);
         if should_send_tool_choice_for_chat(self.api_provider, request.reasoning_effort.as_deref())
             && let Some(choice) = request.tool_choice.as_ref()
             && let Some(mapped) = map_tool_choice_for_chat(choice)
@@ -324,7 +348,11 @@ impl DeepSeekClient {
         request: MessageRequest,
     ) -> Result<StreamEventBox> {
         // Try true SSE streaming via chat completions (widely supported)
-        let messages = build_chat_messages_for_request_and_provider(&request, self.api_provider);
+        let messages = build_chat_messages_for_request_and_provider(
+            &request,
+            self.api_provider,
+            self.replay_reasoning_content,
+        );
         let model =
             wire_model_for_provider_route(self.api_provider, &self.base_url, &request.model);
         let mut body = json!({
@@ -364,6 +392,7 @@ impl DeepSeekClient {
             }
             body["tools"] = json!(chat_tools);
         }
+        apply_parallel_tool_calls(&mut body, self.parallel_tool_calls);
         if should_send_tool_choice_for_chat(self.api_provider, request.reasoning_effort.as_deref())
             && let Some(choice) = request.tool_choice.as_ref()
             && let Some(mapped) = map_tool_choice_for_chat(choice)
@@ -401,6 +430,7 @@ impl DeepSeekClient {
             &model,
             request.reasoning_effort.as_deref(),
             self.api_provider,
+            self.replay_reasoning_content,
         );
         mirror_minimax_reasoning_details_for_body(&mut body, self.api_provider);
 
@@ -713,8 +743,10 @@ pub(super) fn build_chat_messages_for_request(request: &MessageRequest) -> Vec<V
 pub(super) fn build_chat_messages_for_request_and_provider(
     request: &MessageRequest,
     provider: ApiProvider,
+    configured_replay_reasoning: Option<bool>,
 ) -> Vec<Value> {
-    PromptBuilder::for_request(request).build_for_provider(provider)
+    PromptBuilder::for_request(request)
+        .build_for_provider(provider, configured_replay_reasoning)
 }
 
 pub(crate) fn inspect_prompt_for_request(request: &MessageRequest) -> PromptInspection {
@@ -755,7 +787,11 @@ impl<'a> PromptBuilder<'a> {
         )
     }
 
-    fn build_for_provider(self, provider: ApiProvider) -> Vec<Value> {
+    fn build_for_provider(
+        self,
+        provider: ApiProvider,
+        configured_replay_reasoning: Option<bool>,
+    ) -> Vec<Value> {
         let mut messages = build_chat_messages_with_reasoning(
             self.system,
             self.messages,
@@ -764,6 +800,7 @@ impl<'a> PromptBuilder<'a> {
                 provider,
                 self.model,
                 self.reasoning_effort,
+                configured_replay_reasoning,
             ),
             false,
         );
@@ -2060,8 +2097,14 @@ pub(super) fn sanitize_thinking_mode_messages(
     model: &str,
     effort: Option<&str>,
     provider: ApiProvider,
+    configured_replay_reasoning: Option<bool>,
 ) -> Option<u32> {
-    if !should_replay_reasoning_content_for_provider(provider, model, effort) {
+    if !should_replay_reasoning_content_for_provider(
+        provider,
+        model,
+        effort,
+        configured_replay_reasoning,
+    ) {
         return None;
     }
     let messages = body.get_mut("messages").and_then(Value::as_array_mut)?;
@@ -2222,6 +2265,7 @@ fn should_replay_reasoning_content_for_provider(
     provider: ApiProvider,
     model: &str,
     effort: Option<&str>,
+    configured: Option<bool>,
 ) -> bool {
     if effort
         .map(|value| {
@@ -2233,6 +2277,14 @@ fn should_replay_reasoning_content_for_provider(
         .unwrap_or(false)
     {
         return false;
+    }
+
+    // [pinvou3-fork] Explicit `[providers.<name>] replay_reasoning_content`
+    // wins over the built-in heuristics, so reasoning-capable endpoints
+    // routed through the generic `openai` provider (Doubao Ark, Xiaomi MiMo,
+    // GLM) can opt into replay without a code change.
+    if let Some(configured) = configured {
+        return configured;
     }
 
     if requires_reasoning_content(model) {
@@ -3167,7 +3219,7 @@ mod arcee_waf_message_encoding_tests {
         let system = "Run calculations with `python -c 'print(1)'` when a tool is available.";
         let request = request_with_system(system);
 
-        let messages = build_chat_messages_for_request_and_provider(&request, ApiProvider::Arcee);
+        let messages = build_chat_messages_for_request_and_provider(&request, ApiProvider::Arcee, None);
         let content = &messages[0]["content"];
 
         assert!(
@@ -3187,7 +3239,7 @@ mod arcee_waf_message_encoding_tests {
         let system = "Run calculations with `python -c 'print(1)'` when a tool is available.";
         let request = request_with_system(system);
 
-        let messages = build_chat_messages_for_request_and_provider(&request, ApiProvider::Openai);
+        let messages = build_chat_messages_for_request_and_provider(&request, ApiProvider::Openai, None);
 
         assert_eq!(messages[0]["content"].as_str(), Some(system));
     }
@@ -3197,7 +3249,7 @@ mod arcee_waf_message_encoding_tests {
         let system = "Use read-only tools to inspect files before reporting results.";
         let request = request_with_system(system);
 
-        let messages = build_chat_messages_for_request_and_provider(&request, ApiProvider::Arcee);
+        let messages = build_chat_messages_for_request_and_provider(&request, ApiProvider::Arcee, None);
 
         assert_eq!(messages[0]["content"].as_str(), Some(system));
     }
@@ -3242,7 +3294,7 @@ mod minimax_reasoning_replay_tests {
     fn minimax_history_replays_thinking_as_reasoning_details() {
         let request = request_with_assistant_thinking();
 
-        let messages = build_chat_messages_for_request_and_provider(&request, ApiProvider::Minimax);
+        let messages = build_chat_messages_for_request_and_provider(&request, ApiProvider::Minimax, None);
         let assistant = &messages[0];
 
         assert_eq!(
@@ -4517,10 +4569,10 @@ mod alias_thinking_detection_tests {
     //! turn. See upstream API docs:
     //! https://api-docs.deepseek.com/guides/thinking_mode
     use super::{
-        apply_inkling_reasoning_effort, apply_openai_reasoning_effort, apply_provider_token_limit,
-        is_reasoning_model_for_stream, provider_accepts_reasoning_content,
-        requires_reasoning_content, should_replay_reasoning_content,
-        should_replay_reasoning_content_for_provider,
+        apply_inkling_reasoning_effort, apply_openai_reasoning_effort, apply_parallel_tool_calls,
+        apply_provider_token_limit, is_reasoning_model_for_stream,
+        provider_accepts_reasoning_content, requires_reasoning_content,
+        should_replay_reasoning_content, should_replay_reasoning_content_for_provider,
     };
     use crate::config::ApiProvider;
     use serde_json::json;
@@ -4617,27 +4669,105 @@ mod alias_thinking_detection_tests {
             ApiProvider::Moonshot,
             "kimi-k2.7-code",
             None,
+            None,
         ));
         assert!(should_replay_reasoning_content_for_provider(
             ApiProvider::Moonshot,
             "kimi-for-coding",
+            None,
             None,
         ));
         assert!(should_replay_reasoning_content_for_provider(
             ApiProvider::Minimax,
             "MiniMax-M3",
             None,
+            None,
         ));
         assert!(should_replay_reasoning_content_for_provider(
             ApiProvider::Zai,
             "GLM-5.2",
+            None,
             None,
         ));
         assert!(!should_replay_reasoning_content_for_provider(
             ApiProvider::Moonshot,
             "kimi-for-coding",
             Some("off"),
+            None,
         ));
+    }
+
+    /// [pinvou3-fork] `[providers.<name>] replay_reasoning_content` 显式开关
+    /// 必须压过内置启发式：generic `openai` provider 上的推理端点（豆包 Ark /
+    /// MiMo / GLM 走 pinvou3 路由时）可强制开启，白名单 provider 也可强制关闭；
+    /// effort=off 仍然最优先。
+    #[test]
+    fn forkguard_replay_reasoning_content_configured_override_wins() {
+        // openai 不在内置白名单：默认不回传，显式 true 强制回传。
+        assert!(!should_replay_reasoning_content_for_provider(
+            ApiProvider::Openai,
+            "doubao-seed-evolving",
+            None,
+            None,
+        ));
+        assert!(should_replay_reasoning_content_for_provider(
+            ApiProvider::Openai,
+            "doubao-seed-evolving",
+            None,
+            Some(true),
+        ));
+        assert!(should_replay_reasoning_content_for_provider(
+            ApiProvider::Openai,
+            "mimo-v2.5-pro",
+            None,
+            Some(true),
+        ));
+        // 白名单 provider 可被显式 false 关闭。
+        assert!(!should_replay_reasoning_content_for_provider(
+            ApiProvider::Moonshot,
+            "kimi-k2.7-code",
+            None,
+            Some(false),
+        ));
+        // effort=off 优先级高于显式 true。
+        assert!(!should_replay_reasoning_content_for_provider(
+            ApiProvider::Openai,
+            "doubao-seed-evolving",
+            Some("off"),
+            Some(true),
+        ));
+    }
+
+    /// [pinvou3-fork] `[providers.<name>] parallel_tool_calls` 只在请求携带
+    /// 工具时下发显式标志；未配置时保持服务端默认（DashScope 兼容模式默认
+    /// false,OpenAI 默认 true)。
+    #[test]
+    fn forkguard_parallel_tool_calls_only_sent_with_tools_when_configured() {
+        let mut body = json!({"model": "qwen3.7-plus", "messages": []});
+        apply_parallel_tool_calls(&mut body, Some(true));
+        assert!(
+            body.get("parallel_tool_calls").is_none(),
+            "无工具时不得发送 parallel_tool_calls"
+        );
+
+        body["tools"] = json!([{"type": "function", "function": {"name": "t"}}]);
+        apply_parallel_tool_calls(&mut body, Some(true));
+        assert_eq!(body["parallel_tool_calls"], json!(true));
+        apply_parallel_tool_calls(&mut body, Some(false));
+        assert_eq!(body["parallel_tool_calls"], json!(false));
+
+        let mut body = json!({"model": "qwen3.7-plus", "messages": [], "tools": []});
+        apply_parallel_tool_calls(&mut body, Some(true));
+        assert!(
+            body.get("parallel_tool_calls").is_none(),
+            "空 tools 数组时不得发送 parallel_tool_calls"
+        );
+
+        apply_parallel_tool_calls(&mut body, None);
+        assert!(
+            body.get("parallel_tool_calls").is_none(),
+            "未配置时不得发送 parallel_tool_calls"
+        );
     }
 
     #[test]
@@ -4818,22 +4948,26 @@ mod alias_thinking_detection_tests {
             ApiProvider::Openai,
             "deepseek-v4-flash",
             None,
+            None,
         ));
         assert!(should_replay_reasoning_content_for_provider(
             ApiProvider::Openai,
             "deepseek-v4-pro",
+            None,
             None,
         ));
         assert!(should_replay_reasoning_content_for_provider(
             ApiProvider::Openai,
             "deepseek-reasoner",
             Some("medium"),
+            None,
         ));
         // The documented escape hatch still wins over model detection.
         assert!(!should_replay_reasoning_content_for_provider(
             ApiProvider::Openai,
             "deepseek-v4-flash",
             Some("off"),
+            None,
         ));
     }
 
@@ -4845,10 +4979,12 @@ mod alias_thinking_detection_tests {
             ApiProvider::Openai,
             "qwen3-coder",
             None,
+            None,
         ));
         assert!(!should_replay_reasoning_content_for_provider(
             ApiProvider::Openai,
             "claude-sonnet-4-6",
+            None,
             None,
         ));
     }
@@ -4938,7 +5074,7 @@ mod alias_thinking_detection_tests {
             for provider in [ApiProvider::Openai, ApiProvider::Deepseek] {
                 assert_eq!(
                     is_reasoning_model_for_stream(provider, model),
-                    should_replay_reasoning_content_for_provider(provider, model, None),
+                    should_replay_reasoning_content_for_provider(provider, model, None, None),
                     "stream vs replay disagree for {model} on {provider:?}"
                 );
             }
